@@ -1,0 +1,54 @@
+package views
+
+// LoginStep is "phone", "code" or "password".
+templ LoginPage(step, errMsg string) {
+	@Layout("Connect · Telegram Cleanup") {
+		<main class="center">
+			<div class="card narrow">
+				@Brand()
+				@LoginForm(step, errMsg)
+				<p class="fine">
+					Your session is stored only on this machine in <code>data/session.json</code>.
+					The app talks to Telegram directly from your computer.
+				</p>
+			</div>
+		</main>
+	}
+}
+
+templ LoginForm(step, errMsg string) {
+	<div id="login">
+		switch step {
+			case "code":
+				<h1>Enter the code</h1>
+				<p class="muted">Telegram sent a login code to your Telegram app (check the “Telegram” service chat).</p>
+				<form hx-post="/login/code" hx-target="#login" hx-swap="outerHTML" hx-disabled-elt="find button">
+					<label>Login code<input name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus/></label>
+					@loginError(errMsg)
+					<button class="btn primary" type="submit">Verify</button>
+				</form>
+			case "password":
+				<h1>Two-step verification</h1>
+				<p class="muted">Your account has a cloud password. Enter it to finish connecting.</p>
+				<form hx-post="/login/password" hx-target="#login" hx-swap="outerHTML" hx-disabled-elt="find button">
+					<label>Password<input name="password" type="password" autocomplete="current-password" required autofocus/></label>
+					@loginError(errMsg)
+					<button class="btn primary" type="submit">Unlock</button>
+				</form>
+			default:
+				<h1>Connect your Telegram</h1>
+				<p class="muted">Log in with your phone number, the same way the Telegram app does.</p>
+				<form hx-post="/login/phone" hx-target="#login" hx-swap="outerHTML" hx-disabled-elt="find button">
+					<label>Phone number<input name="phone" type="tel" placeholder="+233 20 000 0000" autocomplete="tel" required autofocus/></label>
+					@loginError(errMsg)
+					<button class="btn primary" type="submit">Send code</button>
+				</form>
+		}
+	</div>
+}
+
+templ loginError(msg string) {
+	if msg != "" {
+		<p class="error">{ msg }</p>
+	}
+}

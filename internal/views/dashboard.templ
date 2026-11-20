@@ -1,0 +1,342 @@
+package views
+
+import (
+	"fmt"
+	"github.com/bograh/telegram-cleanup/internal/ai"
+	"github.com/bograh/telegram-cleanup/internal/store"
+)
+
+templ DashboardPage(d Dashboard) {
+	@Layout("Telegram Cleanup") {
+		<header class="topbar">
+			@Brand()
+			<div class="topbar-right">
+				if d.Me != "" {
+					<span class="me">{ d.Me }</span>
+				}
+				@JobStatus(d.Job, d.AIEnabled, d.Total > 0)
+			</div>
+		</header>
+		<main class="page">
+			@OverviewSection(d)
+			@Filters(d)
+			@ChatSection(d)
+		</main>
+		@BulkBar()
+	}
+}
+
+// JobStatus holds the Scan / Analyze buttons and live progress. It polls itself while a job runs.
+templ JobStatus(j Job, aiEnabled, hasChats bool) {
+	if j.Running {
+		<div id="job" class="job running" hx-get="/status" hx-trigger="every 1s" hx-swap="outerHTML">
+			<div class="job-label">
+				<span class="spinner" aria-hidden="true"></span>
+				{ j.Msg }
+				if j.Total > 0 {
+					<span class="muted">{ fmt.Sprintf("%d / %d", j.Done, j.Total) }</span>
+				}
+			</div>
+			<div class="bar"><span style={ fmt.Sprintf("width:%d%%", j.Percent()) }></span></div>
+			if j.Name == "bulk" {
+				<button class="btn tiny ghost stop" hx-post="/stop" hx-target="#job" hx-swap="outerHTML">Stop</button>
+			}
+		</div>
+	} else {
+		<div id="job" class="job">
+			if j.Err != "" {
+				<span class="job-error" title={ j.Err }>⚠ { j.Err }</span>
+			}
+			<button class="btn" hx-post="/scan" hx-target="#job" hx-swap="outerHTML">
+				if hasChats {
+					Rescan Telegram
+				} else {
+					Scan Telegram
+				}
+			</button>
+			if aiEnabled {
+				<button class="btn primary" hx-post="/analyze" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } title="Analyze chats that don't have a verdict yet">
+					✦ Analyze with AI
+				</button>
+				<button class="btn ghost small" hx-post="/analyze?all=1" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } hx-confirm="Re-run the AI on every chat? This repeats the API calls.">
+					Re-analyze all
+				</button>
+			} else {
+				<span class="muted small" title="Set AI_BASE_URL, AI_API_KEY and AI_MODEL in .env">AI not configured</span>
+			}
+		</div>
+	}
+}
+
+templ OverviewSection(d Dashboard) {
+	<section id="overview" hx-get="/overview" hx-trigger="dataChanged from:body, statsChanged from:body" hx-include="#filters" hx-swap="outerHTML">
+		if d.Total == 0 {
+			<div class="empty card">
+				<h2>Let’s look at your Telegram</h2>
+				<p class="muted">Click <b>Scan Telegram</b> to list your channels, groups and bots. Personal chats with people are skipped.</p>
+			</div>
+		} else {
+			<div class="stats">
+				@stat("Chats", compact(d.Total), fmt.Sprintf("scanned %s", ago(d.ScannedAt)))
+				@stat("Channels", compact(d.Channels), "")
+				@stat("Groups", compact(d.Groups), "")
+				@stat("Bots", compact(d.Bots), "")
+				@stat("Unread", compact(d.Unread), "messages waiting")
+				@stat("Analyzed", fmt.Sprintf("%d%%", d.Analysed*100/max(d.Total, 1)), fmt.Sprintf("%d of %d", d.Analysed, d.Total))
+			</div>
+			<div class="overview-grid">
+				<div class="card ai-card">
+					<div class="card-kicker">✦ AI overview</div>
+					if d.Overview != nil {
+						<h2>{ d.Overview.Headline }</h2>
+						<p>{ d.Overview.Summary }</p>
+						if len(d.Overview.QuickWins) > 0 {
+							<h3>Quick wins</h3>
+							<ul class="wins">
+								for _, w := range d.Overview.QuickWins {
+									<li>{ w }</li>
+								}
+							</ul>
+						}
+						<p class="fine">Generated { ago(d.Overview.CreatedAt) } with <code>{ d.AIModel }</code></p>
+					} else if d.AIEnabled {
+						<p class="muted">Run <b>Analyze with AI</b> to categorize every chat and get cleanup suggestions.</p>
+					} else {
+						<p class="muted">Configure an OpenAI-compatible API in <code>.env</code> (<code>AI_BASE_URL</code>, <code>AI_API_KEY</code>, <code>AI_MODEL</code>) to get AI categories and suggestions. You can still filter and clean up by activity and unread counts.</p>
+					}
+				</div>
+				<div class="card">
+					<div class="card-kicker">Suggestions</div>
+					<div class="recs">
+						for _, r := range d.Recs {
+							<button type="button" class={ "rec-tile", "rec-" + r.Label, templ.KV("active", d.Filter.Rec == r.Label) } data-filter="rec" data-value={ r.Label }>
+								<span class="rec-n">{ fmt.Sprint(r.N) }</span>
+								<span>{ recLabel(r.Label) }</span>
+							</button>
+						}
+					</div>
+					if len(d.Categories) > 0 {
+						<div class="card-kicker spaced">Categories</div>
+						<div class="chips">
+							for _, c := range d.Categories {
+								<button type="button" class={ "chip", templ.KV("active", d.Filter.Cat == c.Label) } data-filter="cat" data-value={ c.Label }>
+									{ c.Label } <b>{ fmt.Sprint(c.N) }</b>
+								</button>
+							}
+						</div>
+					}
+				</div>
+			</div>
+		}
+	</section>
+}
+
+templ stat(label, value, sub string) {
+	<div class="stat">
+		<div class="stat-label">{ label }</div>
+		<div class="stat-value">{ value }</div>
+		if sub != "" {
+			<div class="stat-sub">{ sub }</div>
+		}
+	</div>
+}
+
+templ Filters(d Dashboard) {
+	<form id="filters" class="filters" hx-get="/chats" hx-target="#chats" hx-swap="outerHTML" hx-trigger="input delay:250ms, change" hx-sync="this:replace" onsubmit="return false">
+		<input type="search" name="q" value={ d.Filter.Q } placeholder="Search chats…" aria-label="Search"/>
+		<select name="kind" aria-label="Type">
+			<option value="">All types</option>
+			<option value="channel" selected?={ selected(d.Filter.Kind, "channel") }>Channels</option>
+			<option value="group" selected?={ selected(d.Filter.Kind, "group") }>Groups</option>
+			<option value="bot" selected?={ selected(d.Filter.Kind, "bot") }>Bots</option>
+		</select>
+		<select name="cat" aria-label="Category">
+			<option value="">All categories</option>
+			for _, c := range ai.Categories {
+				<option value={ c } selected?={ selected(d.Filter.Cat, c) }>{ c }</option>
+			}
+		</select>
+		<select name="rec" aria-label="Suggestion">
+			<option value="">All suggestions</option>
+			for _, r := range []string{store.RecLeave, store.RecArchive, store.RecMute, store.RecKeep} {
+				<option value={ r } selected?={ selected(d.Filter.Rec, r) }>{ recLabel(r) }</option>
+			}
+		</select>
+		<select name="sort" aria-label="Sort">
+			<option value="activity" selected?={ selected(d.Filter.Sort, "activity") }>Most active</option>
+			<option value="noise" selected?={ selected(d.Filter.Sort, "noise") }>Noisiest</option>
+			<option value="unread" selected?={ selected(d.Filter.Sort, "unread") }>Most unread</option>
+			<option value="members" selected?={ selected(d.Filter.Sort, "members") }>Most members</option>
+			<option value="last" selected?={ selected(d.Filter.Sort, "last") }>Least recent</option>
+			<option value="title" selected?={ selected(d.Filter.Sort, "title") }>A–Z</option>
+		</select>
+		<button type="button" class="btn ghost small" data-reset>Clear</button>
+	</form>
+}
+
+templ ChatSection(d Dashboard) {
+	<section id="chats" hx-get="/chats" hx-trigger="dataChanged from:body" hx-include="#filters" hx-swap="outerHTML">
+		if d.Total > 0 {
+			<form id="bulk" onsubmit="return false">
+				<div class="table-head">
+					<label class="check"><input type="checkbox" data-select-all aria-label="Select all shown"/></label>
+					<span>{ fmt.Sprintf("%d shown", d.ShownCount) }</span>
+					<div class="quick-select" role="group" aria-label="Quick select">
+						<span class="muted">Select:</span>
+						<button type="button" class="chip" data-select="all">All shown</button>
+						<button type="button" class="chip" data-select="kind:channel">Channels</button>
+						<button type="button" class="chip" data-select="kind:group">Groups</button>
+						<button type="button" class="chip" data-select="kind:bot">Bots</button>
+						if d.Analysed > 0 {
+							<button type="button" class="chip q-leave" data-select="rec:leave">Suggested leave</button>
+							<button type="button" class="chip q-archive" data-select="rec:archive">Suggested archive</button>
+							<button type="button" class="chip q-mute" data-select="rec:mute">Suggested mute</button>
+						}
+						<button type="button" class="chip" data-select="unread">Has unread</button>
+						<button type="button" class="chip" data-select="none">None</button>
+					</div>
+				</div>
+				if len(d.Chats) == 0 {
+					<p class="muted pad">No chats match these filters.</p>
+				}
+				<ul class="rows">
+					for _, c := range d.Chats {
+						@ChatRow(c)
+					}
+				</ul>
+			</form>
+		}
+	</section>
+}
+
+templ ChatRow(c store.Chat) {
+	<li class="row">
+		<label class="check">
+			<input
+				type="checkbox"
+				name="keys"
+				value={ c.Key }
+				aria-label={ "Select " + c.Title }
+				data-kind={ string(c.Kind) }
+				data-rec={ recOf(c) }
+				data-owner={ fmt.Sprint(c.Owner) }
+				data-unread={ fmt.Sprint(c.Unread) }
+			/>
+		</label>
+		<div class="avatar" style={ avatarHue(c.Key) }>{ initial(c.Title) }</div>
+		<div class="main">
+			<div class="title-line">
+				<span class="title">{ c.Title }</span>
+				if c.Username != "" {
+					<a class="handle" href={ templ.SafeURL("https://t.me/" + c.Username) } target="_blank" rel="noopener">{ "@" + c.Username }</a>
+				}
+				<span class={ "kind", "kind-" + string(c.Kind) }>{ kindLabel(c.Kind) }</span>
+				if c.Owner {
+					<span class="tag">owner</span>
+				}
+				if c.Muted {
+					<span class="tag">muted</span>
+				}
+				if c.Archived {
+					<span class="tag">archived</span>
+				}
+				if c.ScamFlag {
+					<span class="tag danger">flagged scam</span>
+				}
+			</div>
+			if c.Analysis != nil {
+				<div class="summary">
+					<span class="cat">{ c.Analysis.Category }</span>
+					{ c.Analysis.Summary }
+				</div>
+			} else if len(c.Samples) > 0 {
+				<div class="summary muted">“{ c.Samples[0] }”</div>
+			}
+			<div class="meta">
+				<span title="Estimated from recent messages">{ rate(c.MsgsPerDay) }</span>
+				if c.Members > 0 {
+					<span>{ compact(c.Members) } members</span>
+				}
+				<span>last post { ago(c.LastMessage) }</span>
+				if c.Unread > 0 {
+					<span class="unread">{ compact(c.Unread) } unread</span>
+				}
+			</div>
+		</div>
+		<div class="verdict">
+			if c.Analysis != nil {
+				<span class={ "rec", "rec-" + c.Analysis.Recommendation } title={ c.Analysis.Reason }>{ recLabel(c.Analysis.Recommendation) }</span>
+				<span class="noise" title="Noise score 0–10">
+					<span class="noise-bar"><span style={ fmt.Sprintf("width:%d%%", c.Analysis.Noise*10) }></span></span>
+					{ fmt.Sprint(c.Analysis.Noise) }
+				</span>
+				<span class="reason">{ c.Analysis.Reason }</span>
+			}
+		</div>
+		<div class="row-actions">
+			if c.Unread > 0 {
+				@rowAction(c, "read", "Mark read", "")
+			}
+			if !c.Muted {
+				@rowAction(c, "mute", "Mute", "")
+			}
+			if !c.Archived {
+				@rowAction(c, "archive", "Archive", "")
+			}
+			if c.Kind == store.KindBot {
+				@rowAction(c, "leave", "Block", "Block "+c.Title+" and delete the chat?")
+			} else {
+				@rowAction(c, "leave", "Leave", "Leave "+c.Title+"?")
+			}
+		</div>
+	</li>
+}
+
+templ rowAction(c store.Chat, action, label, confirm string) {
+	<button
+		type="button"
+		class={ "btn tiny", templ.KV("danger", action == "leave") }
+		hx-post="/actions"
+		hx-vals={ templ.JSONString(map[string]string{"keys": c.Key, "action": action}) }
+		hx-include="#filters"
+		hx-target="#chats"
+		hx-swap="outerHTML"
+		if confirm != "" {
+			hx-confirm={ confirm }
+		}
+	>{ label }</button>
+}
+
+templ BulkBar() {
+	<div id="bulkbar" class="bulkbar" hidden>
+		<div class="bulk-count">
+			<b data-count>0</b> selected
+			<span class="bulk-breakdown" data-breakdown></span>
+		</div>
+		<div class="bulk-buttons">
+			@bulkButton("read", "Mark read", "")
+			@bulkButton("mute", "Mute", "")
+			@bulkButton("archive", "Archive", "")
+			@bulkButton("leave", "Leave", "Leave the selected chats?")
+			<button class="btn tiny ghost" type="button" data-clear-selection>Cancel</button>
+		</div>
+	</div>
+}
+
+// bulkButton starts a background bulk job; progress shows in the top bar.
+// The leave button's hx-confirm text is rewritten by app.js with exact counts.
+templ bulkButton(action, label, confirm string) {
+	<button
+		type="button"
+		class={ "btn tiny", templ.KV("danger", action == "leave") }
+		data-bulk={ action }
+		hx-post="/bulk"
+		hx-include="#bulk"
+		hx-vals={ templ.JSONString(map[string]string{"action": action}) }
+		hx-target="#job"
+		hx-swap="outerHTML"
+		if confirm != "" {
+			hx-confirm={ confirm }
+		}
+	>{ label }</button>
+}
