@@ -63,7 +63,9 @@ if you edit `.templ` files. The generated `*_templ.go` files are committed.
 | `AI_API_KEY` | — | Sent as `Authorization: Bearer …`; may be empty for local servers |
 | `AI_MODEL` | — | AI features are disabled until this is set |
 | `AI_JSON_MODE` | `true` | Sends `response_format: json_object`; set `false` if your server rejects it |
-| `AI_BATCH_SIZE` / `AI_CONCURRENCY` | `25` / `3` | Lower these for small local models |
+| `AI_BATCH_SIZE` / `AI_CONCURRENCY` | `25` / `3` | Lower these for small local models or rate-limited free tiers |
+| `AI_MAX_TOKENS` | `0` (auto) | Cap on `max_tokens`. The app also learns the provider's limit from "request too large" errors and splits batches to fit |
+| `AI_REASONING_EFFORT` | — | Sent as `reasoning_effort`, e.g. `none` for Qwen3 on Groq. Thinking tokens count against output limits |
 | `ADDR` | `127.0.0.1:8080` | Listen address |
 | `DATA_DIR` | `data` | Session + scan cache |
 

@@ -61,6 +61,7 @@ func main() {
 	if model := env("AI_MODEL", ""); model != "" {
 		batch, _ := strconv.Atoi(env("AI_BATCH_SIZE", "25"))
 		workers, _ := strconv.Atoi(env("AI_CONCURRENCY", "3"))
+		maxTokens, _ := strconv.Atoi(env("AI_MAX_TOKENS", "0"))
 		an = ai.New(ai.Config{
 			BaseURL:   env("AI_BASE_URL", "https://api.openai.com/v1"),
 			APIKey:    env("AI_API_KEY", ""),
@@ -68,6 +69,9 @@ func main() {
 			JSONMode:  env("AI_JSON_MODE", "true") != "false",
 			BatchSize: batch,
 			Workers:   workers,
+			MaxTokens: maxTokens,
+			// e.g. "none" for Qwen3 on Groq, "low" for OpenAI reasoning models.
+			ReasoningEffort: env("AI_REASONING_EFFORT", ""),
 		})
 	}
 

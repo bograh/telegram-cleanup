@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,11 +36,25 @@ type Config struct {
 	JSONMode  bool
 	BatchSize int
 	Workers   int
+	// MaxTokens caps max_tokens on every request (0 = no cap). Useful for
+	// providers with small output-tokens-per-minute limits.
+	MaxTokens int
+	// ReasoningEffort is sent as reasoning_effort when set (e.g. "none" for
+	// Qwen3 on Groq, "minimal"/"low" for OpenAI reasoning models).
+	ReasoningEffort string
 }
 
 type Analyzer struct {
 	cfg  Config
 	http *http.Client
+
+	mu sync.Mutex
+	// limit is the provider's max output tokens per request, learned from a
+	// "request too large" error. 0 = unknown.
+	limit int
+	// useCompletionTokens is set when the provider rejects max_tokens and
+	// wants max_completion_tokens (newer OpenAI reasoning models).
+	useCompletionTokens bool
 }
 
 func New(cfg Config) *Analyzer {
@@ -60,10 +76,13 @@ type message struct {
 }
 
 type chatRequest struct {
-	Model          string    `json:"model"`
-	Messages       []message `json:"messages"`
-	Temperature    float64   `json:"temperature"`
-	ResponseFormat any       `json:"response_format,omitempty"`
+	Model               string    `json:"model"`
+	Messages            []message `json:"messages"`
+	Temperature         float64   `json:"temperature"`
+	MaxTokens           int       `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort     string    `json:"reasoning_effort,omitempty"`
+	ResponseFormat      any       `json:"response_format,omitempty"`
 }
 
 type chatResponse struct {
@@ -78,27 +97,103 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
-// complete sends one chat completion and decodes the JSON object it returns into out.
-func (a *Analyzer) complete(ctx context.Context, system, user string, out any) error {
-	req := chatRequest{
-		Model:       a.cfg.Model,
-		Messages:    []message{{"system", system}, {"user", user}},
-		Temperature: 0.2,
-	}
-	if a.cfg.JSONMode {
-		req.ResponseFormat = map[string]string{"type": "json_object"}
-	}
-	body, _ := json.Marshal(req)
+// TooLargeError means the provider refused the request because the output
+// it might produce exceeds a per-request or per-minute limit. Retrying the
+// same request can never succeed; it has to be made smaller.
+type TooLargeError struct {
+	Limit int // the provider's limit in output tokens, 0 if not stated
+	Msg   string
+}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(time.Duration(attempt*attempt) * 2 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+func (e *TooLargeError) Error() string { return "AI request too large: " + e.Msg }
+
+var limitRe = regexp.MustCompile(`(?i)limit:?\s*(\d+)`)
+
+func tooLarge(status int, msg string) *TooLargeError {
+	m := strings.ToLower(msg)
+	if status != 429 && status != 400 && status != 413 {
+		return nil
+	}
+	if !strings.Contains(m, "request too large") && !strings.Contains(m, "exceed the enforced limit") &&
+		!strings.Contains(m, "reduce max_tokens") && !strings.Contains(m, "max_tokens is too large") {
+		return nil
+	}
+	e := &TooLargeError{Msg: truncate(msg, 300)}
+	if sm := limitRe.FindStringSubmatch(msg); sm != nil {
+		e.Limit, _ = strconv.Atoi(sm[1])
+	}
+	return e
+}
+
+// budget clamps the wanted output tokens to the configured cap and to the
+// provider's learned limit (minus headroom).
+func (a *Analyzer) budget(want int) int {
+	if a.cfg.MaxTokens > 0 {
+		want = min(want, a.cfg.MaxTokens)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.limit > 0 {
+		want = min(want, a.limit*9/10)
+	}
+	return max(want, 64)
+}
+
+func (a *Analyzer) learnLimit(n int) {
+	if n <= 0 {
+		return
+	}
+	a.mu.Lock()
+	if a.limit == 0 || n < a.limit {
+		a.limit = n
+	}
+	a.mu.Unlock()
+}
+
+// retryAfter reads Retry-After (seconds), falling back to exponential backoff.
+func retryAfter(h http.Header, attempt int) time.Duration {
+	if s := h.Get("Retry-After"); s != "" {
+		if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 {
+			return time.Duration(secs*1000)*time.Millisecond + 250*time.Millisecond
 		}
+	}
+	return time.Duration(1<<attempt) * 2 * time.Second
+}
+
+// thinkRe strips reasoning blocks some models (Qwen3, DeepSeek-R1) emit inline.
+var thinkRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+// complete sends one chat completion and decodes the JSON object it returns
+// into out. wantTokens is the expected output size; it is clamped to known
+// provider limits and sent as max_tokens. If the clamped budget drops below
+// minTokens the reply couldn't fit, so it returns *TooLargeError for the
+// caller to shrink the request instead of sending one doomed to be cut off.
+func (a *Analyzer) complete(ctx context.Context, system, user string, wantTokens, minTokens int, out any) error {
+	var lastErr error
+	const attempts = 8
+	for attempt := 0; attempt < attempts; attempt++ {
+		if a.budget(wantTokens) < minTokens {
+			return &TooLargeError{Msg: fmt.Sprintf("needs ~%d output tokens but the provider allows %d", minTokens, a.budget(wantTokens))}
+		}
+		req := chatRequest{
+			Model:           a.cfg.Model,
+			Messages:        []message{{"system", system}, {"user", user}},
+			Temperature:     0.2,
+			ReasoningEffort: a.cfg.ReasoningEffort,
+		}
+		a.mu.Lock()
+		completionTokens := a.useCompletionTokens
+		a.mu.Unlock()
+		if n := a.budget(wantTokens); completionTokens {
+			req.MaxCompletionTokens = n
+		} else {
+			req.MaxTokens = n
+		}
+		if a.cfg.JSONMode {
+			req.ResponseFormat = map[string]string{"type": "json_object"}
+		}
+		body, _ := json.Marshal(req)
+
 		hr, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return err
@@ -110,27 +205,62 @@ func (a *Analyzer) complete(ctx context.Context, system, user string, out any) e
 		resp, err := a.http.Do(hr)
 		if err != nil {
 			lastErr = err
+			if !sleep(ctx, retryAfter(nil, attempt)) {
+				return ctx.Err()
+			}
 			continue
 		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("AI API %s: %s", resp.Status, truncate(string(raw), 300))
-			continue
-		}
+
 		var cr chatResponse
-		if err := json.Unmarshal(raw, &cr); err != nil {
-			return fmt.Errorf("AI API %s: %s", resp.Status, truncate(string(raw), 300))
+		_ = json.Unmarshal(raw, &cr)
+		errMsg := string(raw)
+		if cr.Error != nil {
+			errMsg = cr.Error.Message
+		}
+
+		if resp.StatusCode >= 400 {
+			if tl := tooLarge(resp.StatusCode, errMsg); tl != nil {
+				// Learn the limit and retry with a smaller max_tokens; the
+				// check at the top of the loop hands back to the caller if the
+				// reply can't fit in it.
+				if tl.Limit > 0 && a.budget(wantTokens) > tl.Limit*9/10 {
+					a.learnLimit(tl.Limit)
+					continue
+				}
+				a.learnLimit(tl.Limit)
+				return tl
+			}
+			if resp.StatusCode == 400 && strings.Contains(errMsg, "max_completion_tokens") && !completionTokens {
+				a.mu.Lock()
+				a.useCompletionTokens = true
+				a.mu.Unlock()
+				continue
+			}
+			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("AI API %s: %s", resp.Status, truncate(errMsg, 300))
+				if !sleep(ctx, retryAfter(resp.Header, attempt)) {
+					return ctx.Err()
+				}
+				continue
+			}
+			return fmt.Errorf("AI API %s: %s", resp.Status, truncate(errMsg, 300))
 		}
 		if cr.Error != nil {
 			return fmt.Errorf("AI API error: %s", cr.Error.Message)
 		}
-		if resp.StatusCode >= 400 || len(cr.Choices) == 0 {
-			return fmt.Errorf("AI API %s: %s", resp.Status, truncate(string(raw), 300))
+		if len(cr.Choices) == 0 {
+			return fmt.Errorf("AI API returned no choices: %s", truncate(string(raw), 300))
 		}
-		content := extractJSON(cr.Choices[0].Message.Content)
+		choice := cr.Choices[0]
+		content := extractJSON(choice.Message.Content)
 		if err := json.Unmarshal([]byte(content), out); err != nil {
-			lastErr = fmt.Errorf("model returned invalid JSON (finish_reason=%s): %w", cr.Choices[0].FinishReason, err)
+			if choice.FinishReason == "length" {
+				// Output was cut off at max_tokens: a smaller request is needed.
+				return &TooLargeError{Msg: "the model's reply was cut off at max_tokens"}
+			}
+			lastErr = fmt.Errorf("model returned invalid JSON (finish_reason=%s): %w", choice.FinishReason, err)
 			continue
 		}
 		return nil
@@ -138,8 +268,22 @@ func (a *Analyzer) complete(ctx context.Context, system, user string, out any) e
 	return lastErr
 }
 
-// extractJSON tolerates models that wrap JSON in ``` fences or add prose.
+func sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// extractJSON tolerates models that think out loud, wrap JSON in ``` fences
+// or add prose around it.
 func extractJSON(s string) string {
+	s = thinkRe.ReplaceAllString(s, "")
+	if i := strings.Index(s, "</think>"); i >= 0 { // unterminated opening tag
+		s = s[i+len("</think>"):]
+	}
 	s = strings.TrimSpace(s)
 	if i := strings.Index(s, "{"); i >= 0 {
 		if j := strings.LastIndex(s, "}"); j > i {
@@ -198,6 +342,54 @@ type classifyOutput struct {
 // Progress is called with (done, total) chats analysed.
 type Progress func(done, total int)
 
+// tokensPerChat is a generous estimate of one verdict's JSON size.
+const tokensPerChat = 90
+
+// classifyBatch classifies one batch, splitting it in half whenever the
+// provider says the request is too large (e.g. Groq's 1000 output tokens per
+// minute on free tiers) until it fits or a single chat still doesn't.
+func (a *Analyzer) classifyBatch(ctx context.Context, system string, b []store.Chat) (map[string]store.Analysis, error) {
+	want := len(b)*tokensPerChat + 100
+	if len(b) > 1 && a.budget(want) < want {
+		return a.splitBatch(ctx, system, b)
+	}
+
+	in := make([]chatInput, len(b))
+	for i, c := range b {
+		in[i] = chatInput{
+			Key: c.Key, Kind: string(c.Kind), Title: c.Title, Username: c.Username,
+			Members: c.Members, MsgsPerDay: c.MsgsPerDay, Unread: c.Unread,
+			Muted: c.Muted, Archived: c.Archived, Owner: c.Owner, ScamFlag: c.ScamFlag,
+			Samples: c.Samples,
+		}
+		if !c.LastMessage.IsZero() {
+			in[i].LastMessage = c.LastMessage.Format("2006-01-02")
+		}
+	}
+	payload, _ := json.Marshal(in)
+	var out classifyOutput
+	err := a.complete(ctx, system, "Today is "+time.Now().Format("2006-01-02")+".\n\n"+string(payload), want, want, &out)
+	var tl *TooLargeError
+	if errors.As(err, &tl) && len(b) > 1 {
+		return a.splitBatch(ctx, system, b)
+	}
+	res := make(map[string]store.Analysis, len(out.Results))
+	for _, r := range out.Results {
+		res[r.Key] = normalize(r.Analysis)
+	}
+	return res, err
+}
+
+func (a *Analyzer) splitBatch(ctx context.Context, system string, b []store.Chat) (map[string]store.Analysis, error) {
+	mid := len(b) / 2
+	left, errL := a.classifyBatch(ctx, system, b[:mid])
+	right, errR := a.classifyBatch(ctx, system, b[mid:])
+	for k, v := range right {
+		left[k] = v
+	}
+	return left, errors.Join(errL, errR)
+}
+
 // Classify analyses chats in parallel batches. Partial results are returned
 // alongside the first error so a flaky batch doesn't throw away the rest.
 func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Progress) (map[string]store.Analysis, error) {
@@ -227,29 +419,15 @@ func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Pr
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			in := make([]chatInput, len(b))
-			for i, c := range b {
-				in[i] = chatInput{
-					Key: c.Key, Kind: string(c.Kind), Title: c.Title, Username: c.Username,
-					Members: c.Members, MsgsPerDay: c.MsgsPerDay, Unread: c.Unread,
-					Muted: c.Muted, Archived: c.Archived, Owner: c.Owner, ScamFlag: c.ScamFlag,
-					Samples: c.Samples,
-				}
-				if !c.LastMessage.IsZero() {
-					in[i].LastMessage = c.LastMessage.Format("2006-01-02")
-				}
-			}
-			payload, _ := json.Marshal(in)
-			var out classifyOutput
-			err := a.complete(ctx, system, "Today is "+time.Now().Format("2006-01-02")+".\n\n"+string(payload), &out)
+			res, err := a.classifyBatch(ctx, system, b)
 
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
-			for _, r := range out.Results {
-				results[r.Key] = normalize(r.Analysis)
+			for k, v := range res {
+				results[k] = v
 			}
 			done += len(b)
 			if progress != nil {
@@ -324,7 +502,7 @@ func (a *Analyzer) Overview(ctx context.Context, chats []store.Chat) (*store.Ove
 		"total": len(chats), "by_kind": byKind, "by_category": byCat, "by_recommendation": byRec, "chats": rows,
 	})
 	var out store.Overview
-	if err := a.complete(ctx, overviewSystem, string(payload), &out); err != nil {
+	if err := a.complete(ctx, overviewSystem, string(payload), 800, 350, &out); err != nil {
 		return nil, err
 	}
 	out.CreatedAt = time.Now()
