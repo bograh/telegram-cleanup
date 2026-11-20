@@ -32,3 +32,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local app data: Telegram session (grants full account access!) and scan cache
+data/
+/telegram-cleanup
