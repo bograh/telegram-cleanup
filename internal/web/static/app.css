@@ -257,3 +257,14 @@ form .btn.primary { width: 100%; margin-top: 14px; padding: 10px; }
   .quick-select { margin-left: 0; }
   .bulk-breakdown { display: block; margin: 0; }
 }
+
+/* ---- login extras ---- */
+.login-alt { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 14px; }
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; margin: 18px 0 0; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.callout { border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+.callout.warn { background: var(--archive-soft); color: var(--archive); }
+.notice { color: var(--keep); font-weight: 550; margin: 4px 0; }
+.qr { display: grid; place-items: center; margin: 12px auto 0; width: 248px; height: 248px; background: #fff; border-radius: 12px; padding: 8px; }
+.qr img { width: 232px; height: 232px; image-rendering: pixelated; }
+.center-text { text-align: center; }

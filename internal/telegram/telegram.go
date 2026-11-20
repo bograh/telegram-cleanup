@@ -13,7 +13,7 @@ import (
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/auth/qrlogin"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
@@ -37,14 +37,22 @@ type Client struct {
 	codeHash  string
 	authed    bool
 	selfTitle string
+
+	// QR login: Telegram pushes updateLoginToken when the phone accepts the
+	// QR code; loggedIn latches that signal.
+	loggedIn qrlogin.LoggedIn
+	qrToken  qrlogin.Token
 }
 
 // New starts the MTProto connection in the background. The session is stored
 // in sessionPath so you only log in once.
 func New(ctx context.Context, appID int, appHash, sessionPath string) *Client {
 	c := &Client{ready: make(chan struct{})}
+	dispatcher := tg.NewUpdateDispatcher()
+	c.loggedIn = qrlogin.OnLoginToken(dispatcher)
 	c.tc = telegram.NewClient(appID, appHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: sessionPath},
+		UpdateHandler:  dispatcher,
 	})
 	go func() {
 		c.err = c.tc.Run(ctx, func(ctx context.Context) error {
@@ -101,48 +109,6 @@ func (c *Client) Me() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.selfTitle
-}
-
-// SendCode asks Telegram to send a login code to the phone's Telegram app.
-func (c *Client) SendCode(ctx context.Context, phone string) error {
-	if err := c.wait(ctx); err != nil {
-		return err
-	}
-	sent, err := c.tc.Auth().SendCode(ctx, phone, auth.SendCodeOptions{})
-	if err != nil {
-		return err
-	}
-	code, ok := sent.(*tg.AuthSentCode)
-	if !ok {
-		return fmt.Errorf("unexpected send-code response %T", sent)
-	}
-	c.mu.Lock()
-	c.phone, c.codeHash = phone, code.PhoneCodeHash
-	c.mu.Unlock()
-	return nil
-}
-
-// SignIn completes login with the code. Returns ErrPasswordNeeded for 2FA accounts.
-func (c *Client) SignIn(ctx context.Context, code string) error {
-	if err := c.wait(ctx); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	phone, hash := c.phone, c.codeHash
-	c.mu.Unlock()
-	if hash == "" {
-		return errors.New("request a code first")
-	}
-	a, err := c.tc.Auth().SignIn(ctx, phone, strings.TrimSpace(code), hash)
-	if errors.Is(err, auth.ErrPasswordAuthNeeded) {
-		return ErrPasswordNeeded
-	}
-	if err != nil {
-		return err
-	}
-	u, _ := a.User.(*tg.User)
-	c.setAuthed(u)
-	return nil
 }
 
 // Password completes 2FA login.

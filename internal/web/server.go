@@ -35,6 +35,8 @@ type Server struct {
 	job        views.Job
 	jobCancel  context.CancelFunc
 	jobChanged bool // a job finished and the browser hasn't been told yet
+
+	lastCode telegram.CodeInfo // where the last login code went, for re-rendering
 }
 
 func New(ctx context.Context, tg *telegram.Client, an *ai.Analyzer, st *store.Store, missing []string) *Server {
@@ -48,6 +50,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /login/phone", s.loginPhone)
 	mux.HandleFunc("POST /login/code", s.loginCode)
 	mux.HandleFunc("POST /login/password", s.loginPassword)
+	mux.HandleFunc("POST /login/resend", s.loginResend)
+	mux.HandleFunc("POST /login/qr", s.loginQR)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("POST /scan", s.scan)
 	mux.HandleFunc("POST /analyze", s.analyze)
@@ -139,7 +143,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		render(w, r, views.LoginPage("phone", ""))
+		render(w, r, views.LoginPage(views.Login{Step: "phone"}))
 		return
 	}
 	render(w, r, views.DashboardPage(s.dashboard(filterFrom(r))))
@@ -147,22 +151,50 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 
 // --- login ---
 
+func codeStep(info telegram.CodeInfo) views.Login {
+	return views.Login{Step: "code", Where: info.Where, Next: info.Next, CanResend: info.CanResend, Blocked: info.Blocked}
+}
+
 func (s *Server) loginPhone(w http.ResponseWriter, r *http.Request) {
 	phone := strings.ReplaceAll(strings.TrimSpace(r.FormValue("phone")), " ", "")
-	if err := s.tg.SendCode(r.Context(), phone); err != nil {
-		render(w, r, views.LoginForm("phone", friendly(err)))
-		return
+	info, err := s.tg.SendCode(r.Context(), phone)
+	switch {
+	case errors.Is(err, telegram.ErrAlreadyAuthorized):
+		w.Header().Set("HX-Redirect", "/")
+	case err != nil:
+		render(w, r, views.LoginForm(views.Login{Step: "phone", Err: friendly(err)}))
+	default:
+		s.setCodeInfo(info)
+		render(w, r, views.LoginForm(codeStep(info)))
 	}
-	render(w, r, views.LoginForm("code", ""))
+}
+
+func (s *Server) loginResend(w http.ResponseWriter, r *http.Request) {
+	info, err := s.tg.ResendCode(r.Context())
+	switch {
+	case errors.Is(err, telegram.ErrAlreadyAuthorized):
+		w.Header().Set("HX-Redirect", "/")
+	case err != nil:
+		l := codeStep(s.codeInfo())
+		l.Err = friendly(err)
+		render(w, r, views.LoginForm(l))
+	default:
+		s.setCodeInfo(info)
+		l := codeStep(info)
+		l.Notice = "Code sent again."
+		render(w, r, views.LoginForm(l))
+	}
 }
 
 func (s *Server) loginCode(w http.ResponseWriter, r *http.Request) {
 	err := s.tg.SignIn(r.Context(), r.FormValue("code"))
 	switch {
 	case errors.Is(err, telegram.ErrPasswordNeeded):
-		render(w, r, views.LoginForm("password", ""))
+		render(w, r, views.LoginForm(views.Login{Step: "password"}))
 	case err != nil:
-		render(w, r, views.LoginForm("code", friendly(err)))
+		l := codeStep(s.codeInfo())
+		l.Err = friendly(err)
+		render(w, r, views.LoginForm(l))
 	default:
 		w.Header().Set("HX-Redirect", "/")
 	}
@@ -170,10 +202,38 @@ func (s *Server) loginCode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) loginPassword(w http.ResponseWriter, r *http.Request) {
 	if err := s.tg.Password(r.Context(), r.FormValue("password")); err != nil {
-		render(w, r, views.LoginForm("password", friendly(err)))
+		render(w, r, views.LoginForm(views.Login{Step: "password", Err: friendly(err)}))
 		return
 	}
 	w.Header().Set("HX-Redirect", "/")
+}
+
+// loginQR shows the QR code and is polled by the page until the phone
+// approves the login.
+func (s *Server) loginQR(w http.ResponseWriter, r *http.Request) {
+	st, err := s.tg.QR(r.Context())
+	switch {
+	case errors.Is(err, telegram.ErrPasswordNeeded):
+		render(w, r, views.LoginForm(views.Login{Step: "password"}))
+	case err != nil:
+		render(w, r, views.LoginForm(views.Login{Step: "qr", Err: friendly(err)}))
+	case st.Done:
+		w.Header().Set("HX-Redirect", "/")
+	default:
+		render(w, r, views.LoginForm(views.Login{Step: "qr", QRImage: st.Image}))
+	}
+}
+
+func (s *Server) setCodeInfo(i telegram.CodeInfo) {
+	s.jobMu.Lock()
+	s.lastCode = i
+	s.jobMu.Unlock()
+}
+
+func (s *Server) codeInfo() telegram.CodeInfo {
+	s.jobMu.Lock()
+	defer s.jobMu.Unlock()
+	return s.lastCode
 }
 
 func friendly(err error) string {
@@ -189,6 +249,10 @@ func friendly(err error) string {
 		return "The code expired. Reload the page to request a new one."
 	case strings.Contains(msg, "PASSWORD_HASH_INVALID"):
 		return "Wrong password."
+	case strings.Contains(msg, "SEND_CODE_UNAVAILABLE"):
+		return "Telegram has used up every way to resend the code. Use QR login, or wait a few minutes and start over."
+	case strings.Contains(msg, "AUTH_TOKEN_EXPIRED"):
+		return "The QR code expired before it was scanned. A new one is shown."
 	case strings.Contains(msg, "FLOOD_WAIT"):
 		return "Telegram is rate-limiting login attempts. Wait a bit and try again."
 	}
