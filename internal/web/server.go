@@ -319,11 +319,12 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	render(w, r, views.JobStatus(j, s.ai != nil, len(s.store.Chats()) > 0))
 }
 
-// stop cancels the running job (only bulk jobs show a Stop button).
+// stop cancels the running job. Work already finished is kept.
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.jobMu.Lock()
-	if s.jobCancel != nil {
+	if s.jobCancel != nil && s.job.Running {
 		s.jobCancel()
+		s.job.Stopping = true
 		s.job.Msg = "Stopping…"
 	}
 	s.jobMu.Unlock()
@@ -336,6 +337,11 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	}
 	s.startJob("scan", "Scanning chats", func(ctx context.Context, progress func(int, int)) error {
 		chats, err := s.tg.Scan(ctx, progress)
+		if ctx.Err() != nil {
+			// A partial scan would drop chats from the list, so keep the old one.
+			s.setResult("Scan stopped. Your previous results are unchanged.")
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -362,13 +368,21 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		}
 		var classifyErr error
 		if len(todo) > 0 {
-			res, err := s.ai.Classify(ctx, todo, progress)
-			if res != nil {
-				if serr := s.store.SetAnalyses(res); serr != nil {
-					return serr
+			// Save each batch as it lands so stopping (or a crash) keeps the work.
+			saved := 0
+			save := func(res map[string]store.Analysis) {
+				if err := s.store.SetAnalyses(res); err != nil {
+					log.Printf("saving analyses: %v", err)
+					return
 				}
+				saved += len(res)
 			}
-			if err != nil && res == nil {
+			res, err := s.ai.Classify(ctx, todo, progress, save)
+			if ctx.Err() != nil {
+				s.setResult(fmt.Sprintf("AI stopped. %d of %d chats analyzed and saved. Click Analyze to continue.", saved, len(todo)))
+				return nil
+			}
+			if err != nil && len(res) == 0 {
 				return err
 			}
 			classifyErr = err
@@ -377,6 +391,10 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		s.job.Msg = "Writing overview"
 		s.jobMu.Unlock()
 		ov, err := s.ai.Overview(ctx, s.store.Chats())
+		if ctx.Err() != nil {
+			s.setResult("AI stopped before writing the overview. Chat results are saved.")
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("overview: %w", err)
 		}

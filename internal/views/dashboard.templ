@@ -38,8 +38,10 @@ templ JobStatus(j Job, aiEnabled, hasChats bool) {
 				}
 			</div>
 			<div class="bar"><span style={ fmt.Sprintf("width:%d%%", j.Percent()) }></span></div>
-			if j.Name == "bulk" {
-				<button class="btn tiny ghost stop" hx-post="/stop" hx-target="#job" hx-swap="outerHTML">Stop</button>
+			if j.Stopping {
+				<button class="btn tiny ghost stop" disabled>Stopping…</button>
+			} else {
+				<button class="btn tiny ghost stop" hx-post="/stop" hx-target="#job" hx-swap="outerHTML" hx-disabled-elt="this" title="Stop now. Finished work is kept.">■ Stop</button>
 			}
 		</div>
 	} else {

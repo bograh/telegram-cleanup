@@ -383,6 +383,9 @@ func (a *Analyzer) classifyBatch(ctx context.Context, system string, b []store.C
 func (a *Analyzer) splitBatch(ctx context.Context, system string, b []store.Chat) (map[string]store.Analysis, error) {
 	mid := len(b) / 2
 	left, errL := a.classifyBatch(ctx, system, b[:mid])
+	if ctx.Err() != nil {
+		return left, ctx.Err()
+	}
 	right, errR := a.classifyBatch(ctx, system, b[mid:])
 	for k, v := range right {
 		left[k] = v
@@ -392,7 +395,11 @@ func (a *Analyzer) splitBatch(ctx context.Context, system string, b []store.Chat
 
 // Classify analyses chats in parallel batches. Partial results are returned
 // alongside the first error so a flaky batch doesn't throw away the rest.
-func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Progress) (map[string]store.Analysis, error) {
+// onBatch (optional) receives each batch's results as soon as they arrive, so
+// callers can persist progress; it is never called concurrently. Cancelling
+// ctx stops immediately: queued batches never start, in-flight requests and
+// rate-limit waits are aborted, and ctx.Err() is returned with what finished.
+func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Progress, onBatch func(map[string]store.Analysis)) (map[string]store.Analysis, error) {
 	cats, _ := json.Marshal(Categories)
 	system := fmt.Sprintf(classifySystem, string(cats))
 
@@ -416,18 +423,28 @@ func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Pr
 		wg.Add(1)
 		go func(b []store.Chat) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
 
 			res, err := a.classifyBatch(ctx, system, b)
 
 			mu.Lock()
 			defer mu.Unlock()
-			if err != nil && firstErr == nil {
+			if err != nil && firstErr == nil && ctx.Err() == nil {
 				firstErr = err
 			}
 			for k, v := range res {
 				results[k] = v
+			}
+			if onBatch != nil && len(res) > 0 {
+				onBatch(res)
 			}
 			done += len(b)
 			if progress != nil {
@@ -436,6 +453,9 @@ func (a *Analyzer) Classify(ctx context.Context, chats []store.Chat, progress Pr
 		}(b)
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return results, ctx.Err()
+	}
 	if firstErr != nil && len(results) == 0 {
 		return nil, firstErr
 	}

@@ -19,6 +19,8 @@ type Job struct {
 	Err     string
 	Msg     string
 	Result  string // shown as a toast when the job finishes
+	// Stopping is set once the user clicked Stop and the job is winding down.
+	Stopping bool
 }
 
 func (j Job) Percent() int {

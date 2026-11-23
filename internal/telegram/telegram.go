@@ -220,6 +220,9 @@ func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, er
 
 	out := make([]*store.Chat, 0, len(items))
 	for i, it := range items {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if progress != nil {
 			progress(i, len(items))
 		}
@@ -227,7 +230,11 @@ func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, er
 			return nil, ctx.Err()
 		}
 		out = append(out, it.chat)
-		time.Sleep(150 * time.Millisecond) // be gentle with rate limits
+		select { // be gentle with rate limits, but stop promptly
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	if progress != nil {
 		progress(len(items), len(items))

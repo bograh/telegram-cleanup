@@ -3,10 +3,12 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,7 +52,7 @@ func TestClassifyAndOverview(t *testing.T) {
 	for i := range 5 {
 		chats = append(chats, store.Chat{Key: fmt.Sprintf("channel:%d", i), Kind: store.KindChannel, Title: "c"})
 	}
-	res, err := a.Classify(context.Background(), chats, nil)
+	res, err := a.Classify(context.Background(), chats, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +133,7 @@ func TestAdaptsToOutputTokenLimit(t *testing.T) {
 	for i := range 30 {
 		chats = append(chats, store.Chat{Key: fmt.Sprintf("channel:%d", i), Title: "c"})
 	}
-	res, err := a.Classify(context.Background(), chats, nil)
+	res, err := a.Classify(context.Background(), chats, nil, nil)
 	if err != nil {
 		t.Fatalf("classify: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestMaxTokensCapAvoidsTooLargeUpFront(t *testing.T) {
 	for i := range 20 {
 		chats = append(chats, store.Chat{Key: fmt.Sprintf("channel:%d", i), Title: "c"})
 	}
-	if _, err := a.Classify(context.Background(), chats, nil); err != nil {
+	if _, err := a.Classify(context.Background(), chats, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// 20 chats need ~1900 tokens; with a 900 cap they must be split before
@@ -202,5 +204,87 @@ func TestRateLimitHonoursRetryAfter(t *testing.T) {
 	}
 	if calls != 2 || time.Since(start) > 2*time.Second {
 		t.Fatalf("calls=%d elapsed=%v: should retry once after ~50ms", calls, time.Since(start))
+	}
+}
+
+// TestStopMidAnalysis: batch 1 succeeds, batch 2 hangs at the provider (or
+// sits in a long rate-limit wait). Stopping must return promptly, keep batch
+// 1's results via onBatch, and never send the remaining batches.
+func TestStopMidAnalysis(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	hang := make(chan struct{})
+	defer close(hang)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		var req chatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if n == 2 {
+			select { // hang until the client gives up
+			case <-r.Context().Done():
+			case <-hang:
+			}
+			return
+		}
+		user := req.Messages[1].Content
+		var in []chatInput
+		_ = json.Unmarshal([]byte(user[strings.Index(user, "["):]), &in)
+		var parts []string
+		for _, c := range in {
+			parts = append(parts, fmt.Sprintf(`{"key":%q,"category":"news","summary":"x","recommendation":"keep","reason":"r","noise":1}`, c.Key))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]string{"content": `{"results":[` + strings.Join(parts, ",") + `]}`}}}})
+	}))
+	defer srv.Close()
+
+	a := New(Config{BaseURL: srv.URL, Model: "m", BatchSize: 2, Workers: 1})
+	var chats []store.Chat
+	for i := range 10 { // 5 batches
+		chats = append(chats, store.Chat{Key: fmt.Sprintf("channel:%d", i), Title: "c"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var saved []string
+	onBatch := func(res map[string]store.Analysis) {
+		for k := range res {
+			saved = append(saved, k)
+		}
+		go func() { time.Sleep(100 * time.Millisecond); cancel() }() // user clicks Stop while batch 2 hangs
+	}
+
+	start := time.Now()
+	res, err := a.Classify(ctx, chats, nil, onBatch)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("stop took %v", time.Since(start))
+	}
+	if len(saved) != 2 || len(res) != 2 {
+		t.Fatalf("saved %v, res %d: want batch 1 kept", saved, len(res))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("%d requests sent; batches 3-5 should never start after Stop", calls)
+	}
+}
+
+func TestStopDuringRateLimitWait(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"error":{"message":"Rate limit reached"}}`))
+	}))
+	defer srv.Close()
+	a := New(Config{BaseURL: srv.URL, Model: "m"})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := a.Classify(ctx, []store.Chat{{Key: "k", Title: "t"}}, nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second {
+		t.Fatalf("err=%v after %v: a 60s Retry-After must not block Stop", err, time.Since(start))
 	}
 }
