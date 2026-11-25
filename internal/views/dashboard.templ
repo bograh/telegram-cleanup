@@ -75,7 +75,7 @@ templ OverviewSection(d Dashboard) {
 		if d.Total == 0 {
 			<div class="empty card">
 				<h2>Let’s look at your Telegram</h2>
-				<p class="muted">Click <b>Scan Telegram</b> to list your channels, groups and bots. Personal chats with people are skipped.</p>
+				<p class="muted">Click <b>Scan Telegram</b> to list your channels, groups, bots and chats with deleted accounts. Personal chats with people are skipped.</p>
 			</div>
 		} else {
 			<div class="stats">
@@ -83,8 +83,11 @@ templ OverviewSection(d Dashboard) {
 				@stat("Channels", compact(d.Channels), "")
 				@stat("Groups", compact(d.Groups), "")
 				@stat("Bots", compact(d.Bots), "")
+				if d.Deleted > 0 {
+					@stat("Deleted accounts", compact(d.Deleted), "dead 1:1 chats")
+				}
 				@stat("Unread", compact(d.Unread), "messages waiting")
-				@stat("Analyzed", fmt.Sprintf("%d%%", d.Analysed*100/max(d.Total, 1)), fmt.Sprintf("%d of %d", d.Analysed, d.Total))
+				@stat("Analyzed", fmt.Sprintf("%d%%", d.Analysed*100/max(d.Total-d.Deleted, 1)), fmt.Sprintf("%d of %d", d.Analysed, d.Total-d.Deleted))
 			</div>
 			<div class="overview-grid">
 				<div class="card ai-card">
@@ -151,6 +154,7 @@ templ Filters(d Dashboard) {
 			<option value="channel" selected?={ selected(d.Filter.Kind, "channel") }>Channels</option>
 			<option value="group" selected?={ selected(d.Filter.Kind, "group") }>Groups</option>
 			<option value="bot" selected?={ selected(d.Filter.Kind, "bot") }>Bots</option>
+			<option value="deleted" selected?={ selected(d.Filter.Kind, "deleted") }>Deleted accounts</option>
 		</select>
 		<select name="cat" aria-label="Category">
 			<option value="">All categories</option>
@@ -189,6 +193,9 @@ templ ChatSection(d Dashboard) {
 						<button type="button" class="chip" data-select="kind:channel">Channels</button>
 						<button type="button" class="chip" data-select="kind:group">Groups</button>
 						<button type="button" class="chip" data-select="kind:bot">Bots</button>
+						if d.Deleted > 0 {
+							<button type="button" class="chip" data-select="kind:deleted">Deleted accounts</button>
+						}
 						if d.Analysed > 0 {
 							<button type="button" class="chip q-leave" data-select="rec:leave">Suggested leave</button>
 							<button type="button" class="chip q-archive" data-select="rec:archive">Suggested archive</button>
@@ -287,6 +294,8 @@ templ ChatRow(c store.Chat) {
 			}
 			if c.Kind == store.KindBot {
 				@rowAction(c, "leave", "Block", "Block "+c.Title+" and delete the chat?")
+			} else if c.Kind == store.KindDeleted {
+				@rowAction(c, "leave", "Delete", "Delete this chat with a deleted account?")
 			} else {
 				@rowAction(c, "leave", "Leave", "Leave "+c.Title+"?")
 			}

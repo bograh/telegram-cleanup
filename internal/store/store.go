@@ -19,6 +19,8 @@ const (
 	KindChannel Kind = "channel"
 	KindGroup   Kind = "group"
 	KindBot     Kind = "bot"
+	// KindDeleted is a 1:1 chat with an account that no longer exists.
+	KindDeleted Kind = "deleted"
 )
 
 // PeerType says how to rebuild the Telegram InputPeer for actions.

@@ -57,6 +57,7 @@ type Dashboard struct {
 	Channels     int
 	Groups       int
 	Bots         int
+	Deleted      int
 	Unread       int
 	Analysed     int
 	Recs         []Count
@@ -80,6 +81,8 @@ func Build(all []store.Chat, f Filter) Dashboard {
 			d.Groups++
 		case store.KindBot:
 			d.Bots++
+		case store.KindDeleted:
+			d.Deleted++
 		}
 		d.Unread += c.Unread
 		if c.Analysis != nil {
@@ -162,6 +165,8 @@ func kindLabel(k store.Kind) string {
 		return "Group"
 	case store.KindBot:
 		return "Bot"
+	case store.KindDeleted:
+		return "Deleted account"
 	}
 	return string(k)
 }

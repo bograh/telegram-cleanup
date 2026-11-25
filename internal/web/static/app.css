@@ -182,6 +182,7 @@ form .btn.primary { width: 100%; margin-top: 14px; padding: 10px; }
 .kind, .tag { font-size: 11px; font-weight: 600; border-radius: 6px; padding: 1px 6px; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); }
 .kind-channel { color: var(--accent); }
 .kind-bot { color: var(--mute); }
+.kind-deleted { color: var(--leave); }
 .tag.danger { color: var(--leave); border-color: var(--leave); }
 .summary { margin-top: 3px; overflow-wrap: anywhere; }
 .summary.muted { font-style: italic; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }

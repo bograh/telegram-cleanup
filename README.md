@@ -12,14 +12,14 @@ API: OpenAI, OpenRouter, Groq, Together, Ollama, LM Studio, vLLM and others.
 
 ## What you get
 
-- **Overview**: counts of channels, groups, bots and unread messages, plus an AI-written summary of what your Telegram is mostly made of and a few quick wins.
+- **Overview**: counts of channels, groups, bots, chats with deleted accounts and unread messages, plus an AI-written summary of what your Telegram is mostly made of and a few quick wins.
 - **Per-chat verdicts**: a category (news, crypto & trading, promo & spam, tech, community, …), a one-line summary, a noise score from 0 to 10, and a suggestion (keep, mute, archive or leave) with a short reason.
 - **Activity stats**: messages per day (estimated from recent posts), members, unread count and time since the last post.
 - **Filters and sorting**: by type, category or suggestion, or by noisiest, most unread or least recent.
-- **Bulk actions**: tick rows or use quick-select (all shown, channels, groups, bots, suggested leave/archive/mute, has unread), then Leave, Mute, Archive or Mark read. Quick-select works together with the filters, so "Channels" + the `crypto & trading` filter selects exactly those. Bulk runs happen in the background with progress and a **Stop** button. They're spaced out to avoid Telegram rate limits, and they skip chats that are already muted, archived or read. Leaving bots blocks them and deletes the chat.
+- **Bulk actions**: tick rows or use quick-select (all shown, channels, groups, bots, deleted accounts, suggested leave/archive/mute, has unread), then Leave, Mute, Archive or Mark read. Quick-select works together with the filters, so "Channels" + the `crypto & trading` filter selects exactly those. Bulk runs happen in the background with progress and a **Stop** button. They're spaced out to avoid Telegram rate limits, and they skip chats that are already muted, archived or read. Leaving bots blocks them and deletes the chat; leaving a deleted account's chat just deletes it.
 - **Owner protection**: bulk Leave never touches channels or groups you created. Leave those one at a time from the row's button if you really mean it.
 
-Personal 1:1 chats with people are skipped and never sent to the AI.
+Personal 1:1 chats with people are skipped and never sent to the AI. The exception is chats with **deleted accounts**: they're listed so you can clear them out, but their messages are never read, stored or sent to the AI.
 
 ## Setup
 

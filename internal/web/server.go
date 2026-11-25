@@ -362,7 +362,7 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 	s.startJob("analyze", "AI is reading your chats", func(ctx context.Context, progress func(int, int)) error {
 		var todo []store.Chat
 		for _, c := range s.store.Chats() {
-			if all || c.Analysis == nil {
+			if c.Kind != store.KindDeleted && (all || c.Analysis == nil) {
 				todo = append(todo, c)
 			}
 		}

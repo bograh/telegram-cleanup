@@ -144,8 +144,9 @@ func retry(ctx context.Context, fn func() error) error {
 // Progress is called during a scan with (done, total).
 type Progress func(done, total int)
 
-// Scan lists every channel, group and bot (personal 1:1 chats are skipped),
-// then samples the latest messages of each to estimate activity.
+// Scan lists every channel, group and bot, plus 1:1 chats with deleted
+// accounts (other personal chats are skipped), then samples the latest
+// messages of each to estimate activity.
 func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, error) {
 	if err := c.wait(ctx); err != nil {
 		return nil, err
@@ -176,11 +177,15 @@ func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, er
 		switch p := dlg.Peer.(type) {
 		case *tg.PeerUser:
 			u, ok := e.Entities.Users()[p.UserID]
-			if !ok || !u.Bot {
-				return nil // skip personal chats
+			if !ok || (!u.Bot && !u.Deleted) {
+				return nil // skip personal chats with real people
 			}
-			ch.Kind, ch.PeerType = store.KindBot, store.PeerUser
-			ch.PeerID, ch.AccessHash = u.ID, u.AccessHash
+			ch.PeerType, ch.PeerID, ch.AccessHash = store.PeerUser, u.ID, u.AccessHash
+			if u.Deleted {
+				ch.Kind, ch.Title = store.KindDeleted, "Deleted Account"
+				break
+			}
+			ch.Kind = store.KindBot
 			ch.Title = strings.TrimSpace(u.FirstName + " " + u.LastName)
 			ch.Username = u.Username
 			ch.Verified, ch.ScamFlag = u.Verified, u.Scam || u.Fake
@@ -225,6 +230,11 @@ func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, er
 		}
 		if progress != nil {
 			progress(i, len(items))
+		}
+		if it.chat.Kind == store.KindDeleted {
+			// Personal history: don't read it, store it or send it to the AI.
+			out = append(out, it.chat)
+			continue
 		}
 		if err := c.sample(ctx, it.chat, it.peer, now); err != nil && ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -302,7 +312,8 @@ func inputPeer(ch store.Chat) tg.InputPeerClass {
 	}
 }
 
-// Leave leaves a channel/group. For bots it blocks the bot and deletes the chat.
+// Leave leaves a channel/group. For bots it blocks the bot and deletes the
+// chat; for deleted accounts it just deletes the chat.
 func (c *Client) Leave(ctx context.Context, ch store.Chat) error {
 	if err := c.wait(ctx); err != nil {
 		return err
@@ -319,6 +330,9 @@ func (c *Client) Leave(ctx context.Context, ch store.Chat) error {
 			return err
 		default:
 			peer := inputPeer(ch)
+			if ch.Kind == store.KindDeleted {
+				return c.deleteHistory(ctx, peer)
+			}
 			if _, err := c.api.ContactsBlock(ctx, &tg.ContactsBlockRequest{ID: peer}); err != nil {
 				return err
 			}
@@ -326,6 +340,20 @@ func (c *Client) Leave(ctx context.Context, ch store.Chat) error {
 			return err
 		}
 	})
+}
+
+// deleteHistory removes a 1:1 chat from the dialog list. Telegram deletes long
+// histories in chunks and reports a non-zero offset until it's done.
+func (c *Client) deleteHistory(ctx context.Context, peer tg.InputPeerClass) error {
+	for {
+		res, err := c.api.MessagesDeleteHistory(ctx, &tg.MessagesDeleteHistoryRequest{Peer: peer})
+		if err != nil {
+			return err
+		}
+		if res.Offset == 0 {
+			return nil
+		}
+	}
 }
 
 // Mute silences notifications forever.

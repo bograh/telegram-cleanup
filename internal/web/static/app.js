@@ -32,12 +32,13 @@
     $("[data-count]", bar).textContent = n;
 
     const count = (kind) => picked.filter((p) => p.kind === kind).length;
-    const ch = count("channel"), gr = count("group"), bo = count("bot");
+    const ch = count("channel"), gr = count("group"), bo = count("bot"), de = count("deleted");
     const owned = picked.filter((p) => p.owner).length;
     const parts = [];
     if (ch) parts.push(plural(ch, "channel", "channels"));
     if (gr) parts.push(plural(gr, "group", "groups"));
     if (bo) parts.push(plural(bo, "bot", "bots"));
+    if (de) parts.push(plural(de, "deleted account", "deleted accounts"));
     if (n > on) parts.push(`${n - on} not shown`);
     $("[data-breakdown]", bar).textContent = parts.length ? `(${parts.join(", ")})` : "";
 
@@ -47,6 +48,7 @@
       const lines = [];
       if (ch || gr) lines.push(`Leave ${[ch && plural(ch, "channel", "channels"), gr && plural(gr, "group", "groups")].filter(Boolean).join(" and ")}`);
       if (bo) lines.push(`Block and delete ${plural(bo, "bot", "bots")}`);
+      if (de) lines.push(`Delete ${plural(de, "chat with a deleted account", "chats with deleted accounts")}`);
       if (owned) lines.push(`(${plural(owned, "chat you own", "chats you own")} will be skipped)`);
       leave.setAttribute("hx-confirm", `${lines.join("\n")}\n\nThis can't be undone from here. Continue?`);
     }
