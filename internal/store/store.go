@@ -70,6 +70,12 @@ type Chat struct {
 	LastMessage time.Time `json:"last_message"`
 	MsgsPerDay  float64   `json:"msgs_per_day"`
 	Samples     []string  `json:"samples,omitempty"`
+	// Sampled says Samples, SampleCount and SampleSince came from a
+	// successful history fetch, so a rescan can reuse them while
+	// TopMessage is unchanged.
+	Sampled     bool      `json:"sampled,omitempty"`
+	SampleCount int       `json:"sample_count,omitempty"`
+	SampleSince time.Time `json:"sample_since,omitempty"`
 
 	Analysis *Analysis `json:"analysis,omitempty"`
 	// Gone is set after the user left/deleted the chat from the dashboard.

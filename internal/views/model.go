@@ -21,6 +21,25 @@ type Job struct {
 	Result  string // shown as a toast when the job finishes
 	// Stopping is set once the user clicked Stop and the job is winding down.
 	Stopping bool
+	// WaitUntil and WaitFor are set while Telegram or the AI provider has
+	// asked us to pause (WaitFor says which).
+	WaitUntil time.Time
+	WaitFor   string
+}
+
+// Waiting is the rate-limit note to show, or "" when the job isn't paused.
+func (j Job) Waiting() string {
+	left := time.Until(j.WaitUntil)
+	if left <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s rate limit · resuming in %s", j.WaitFor, left.Round(time.Second))
+}
+
+// QueuedJob is a job waiting for the running one to finish.
+type QueuedJob struct {
+	ID  int
+	Msg string
 }
 
 func (j Job) Percent() int {
@@ -51,6 +70,7 @@ type Dashboard struct {
 	AIEnabled    bool
 	AIModel      string
 	Job          Job
+	Queue        []QueuedJob
 	Overview     *store.Overview
 	ScannedAt    time.Time
 	Total        int
@@ -155,6 +175,14 @@ func sortChats(cs []store.Chat, by string) {
 			return a.MsgsPerDay > b.MsgsPerDay
 		}
 	})
+}
+
+// queueHint is a button tooltip that says the job will wait its turn.
+func queueHint(j Job, hint string) string {
+	if j.Running {
+		return hint + ". Runs after the current job."
+	}
+	return hint
 }
 
 func kindLabel(k store.Kind) string {

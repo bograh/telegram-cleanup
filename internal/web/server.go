@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,16 +32,38 @@ type Server struct {
 	missing []string // missing required config, shown on the setup page
 	baseCtx context.Context
 
-	jobMu      sync.Mutex
-	job        views.Job
-	jobCancel  context.CancelFunc
-	jobChanged bool // a job finished and the browser hasn't been told yet
+	jobMu     sync.Mutex
+	job       views.Job
+	jobCancel context.CancelFunc
+	queue     []queuedJob // jobs waiting for the current one to finish, in order
+	nextJobID int
+	notes     []string // messages from finished jobs the browser hasn't shown yet
+	dataDirty bool     // a job finished and the browser hasn't refreshed yet
 
 	lastCode telegram.CodeInfo // where the last login code went, for re-rendering
 }
 
 func New(ctx context.Context, tg *telegram.Client, an *ai.Analyzer, st *store.Store, missing []string) *Server {
-	return &Server{tg: tg, ai: an, store: st, missing: missing, baseCtx: ctx}
+	s := &Server{tg: tg, ai: an, store: st, missing: missing, baseCtx: ctx}
+	if tg != nil {
+		tg.OnRateLimit(s.rateLimited("Telegram"))
+	}
+	if an != nil {
+		an.OnRateLimit(s.rateLimited("AI"))
+	}
+	return s
+}
+
+// rateLimited records a rate-limit pause on the running job so the page can
+// show a countdown. Parallel calls may each be paused; the latest end wins.
+func (s *Server) rateLimited(who string) func(until time.Time) {
+	return func(until time.Time) {
+		s.jobMu.Lock()
+		defer s.jobMu.Unlock()
+		if s.job.Running && until.After(s.job.WaitUntil) {
+			s.job.WaitUntil, s.job.WaitFor = until, who
+		}
+	}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -60,6 +83,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /actions", s.actions)
 	mux.HandleFunc("POST /bulk", s.bulk)
 	mux.HandleFunc("POST /stop", s.stop)
+	mux.HandleFunc("POST /queue/cancel", s.cancelQueued)
 	return sameOrigin(mux)
 }
 
@@ -127,7 +151,7 @@ func (s *Server) dashboard(f views.Filter) views.Dashboard {
 		d.Me = s.tg.Me()
 	}
 	s.jobMu.Lock()
-	d.Job = s.job
+	d.Job, d.Queue = s.job, s.queueLocked()
 	s.jobMu.Unlock()
 	return d
 }
@@ -261,16 +285,47 @@ func friendly(err error) string {
 
 // --- background jobs ---
 
-func (s *Server) startJob(name, msg string, fn func(ctx context.Context, progress func(done, total int)) error) bool {
+// jobFunc is the body of a background job. It reports progress and should
+// return promptly once ctx is cancelled.
+type jobFunc func(ctx context.Context, progress func(done, total int)) error
+
+// queuedJob is a job waiting for the one in front of it to finish.
+type queuedJob struct {
+	id   int
+	name string // what kind of job, e.g. "scan"; used to drop duplicates
+	msg  string
+	fn   jobFunc
+}
+
+// startJob runs fn in the background, or queues it behind the running job.
+// It returns the job's place in the queue (0 if it started right away) and
+// false if an identical job is already waiting. Bulk jobs are never treated as
+// duplicates, since each one carries its own selection.
+func (s *Server) startJob(name, msg string, fn jobFunc) (place int, ok bool) {
 	s.jobMu.Lock()
-	if s.job.Running {
-		s.jobMu.Unlock()
-		return false
+	defer s.jobMu.Unlock()
+	s.nextJobID++
+	j := queuedJob{id: s.nextJobID, name: name, msg: msg, fn: fn}
+	if !s.job.Running {
+		s.launchLocked(j)
+		return 0, true
 	}
+	if name != "bulk" {
+		for _, q := range s.queue {
+			if q.name == name {
+				return 0, false
+			}
+		}
+	}
+	s.queue = append(s.queue, j)
+	return len(s.queue), true
+}
+
+// launchLocked starts j now. The caller holds jobMu.
+func (s *Server) launchLocked(j queuedJob) {
 	ctx, cancel := context.WithCancel(s.baseCtx)
-	s.job = views.Job{Name: name, Running: true, Msg: msg}
+	s.job = views.Job{Name: j.name, Running: true, Msg: j.msg}
 	s.jobCancel = cancel
-	s.jobMu.Unlock()
 
 	go func() {
 		defer cancel()
@@ -279,19 +334,42 @@ func (s *Server) startJob(name, msg string, fn func(ctx context.Context, progres
 			s.job.Done, s.job.Total = done, total
 			s.jobMu.Unlock()
 		}
-		err := fn(ctx, progress)
+		err := j.fn(ctx, progress)
+
 		s.jobMu.Lock()
-		s.job.Running = false
-		s.job.Err = ""
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("%s: %v", name, err)
+		defer s.jobMu.Unlock()
+		s.dataDirty = true
+		s.jobCancel = nil
+		if s.job.Result != "" {
+			s.notes = append(s.notes, s.job.Result)
+		}
+		failed := err != nil && !errors.Is(err, context.Canceled)
+		if failed {
+			log.Printf("%s: %v", j.name, err)
+		}
+		if len(s.queue) > 0 {
+			if failed { // the error line is about to be replaced, so toast it
+				s.notes = append(s.notes, fmt.Sprintf("%s failed: %v", j.msg, err))
+			}
+			next := s.queue[0]
+			s.queue = s.queue[1:]
+			s.launchLocked(next)
+			return
+		}
+		s.job.Running, s.job.Stopping, s.job.Result, s.job.Err = false, false, "", ""
+		if failed {
 			s.job.Err = err.Error()
 		}
-		s.jobChanged = true
-		s.jobCancel = nil
-		s.jobMu.Unlock()
 	}()
-	return true
+}
+
+// queueLocked describes the waiting jobs for the page. The caller holds jobMu.
+func (s *Server) queueLocked() []views.QueuedJob {
+	out := make([]views.QueuedJob, len(s.queue))
+	for i, q := range s.queue {
+		out[i] = views.QueuedJob{ID: q.id, Msg: q.msg}
+	}
+	return out
 }
 
 func (s *Server) setResult(msg string) {
@@ -302,24 +380,33 @@ func (s *Server) setResult(msg string) {
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	s.jobMu.Lock()
-	j, changed := s.job, s.jobChanged
-	if !j.Running && changed {
-		s.jobChanged = false
-		s.job.Result = ""
-	}
+	j, waiting, notes, dirty := s.job, s.queueLocked(), s.notes, s.dataDirty
+	s.notes, s.dataDirty = nil, false
 	s.jobMu.Unlock()
-	if !j.Running && changed {
+	if dirty || len(notes) > 0 {
 		trig := map[string]any{"dataChanged": true}
-		if j.Result != "" {
-			trig["toast"] = j.Result
+		if len(notes) > 0 {
+			trig["toast"] = strings.Join(notes, " · ")
 		}
-		b, _ := json.Marshal(trig)
-		w.Header().Set("HX-Trigger", string(b))
+		trigger(w, trig)
 	}
-	render(w, r, views.JobStatus(j, s.ai != nil, len(s.store.Chats()) > 0))
+	render(w, r, views.JobStatus(j, waiting, s.ai != nil, len(s.store.Chats()) > 0))
 }
 
-// stop cancels the running job. Work already finished is kept.
+// queued tells the page a job is waiting its turn, or that it was a duplicate.
+func queued(w http.ResponseWriter, place int, ok bool) {
+	switch {
+	case !ok:
+		toast(w, "That's already queued.")
+	case place == 1:
+		toast(w, "Queued. It starts when the current job finishes.")
+	case place > 1:
+		toast(w, fmt.Sprintf("Queued. %d jobs are ahead of it.", place))
+	}
+}
+
+// stop cancels the running job. Work already finished is kept, and the next
+// queued job (if any) starts afterwards.
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.jobMu.Lock()
 	if s.jobCancel != nil && s.job.Running {
@@ -331,12 +418,30 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.status(w, r)
 }
 
+// cancelQueued removes a job that hasn't started yet.
+func (s *Server) cancelQueued(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(r.FormValue("id"))
+	s.jobMu.Lock()
+	for i, q := range s.queue {
+		if q.id == id {
+			s.queue = append(s.queue[:i:i], s.queue[i+1:]...)
+			break
+		}
+	}
+	s.jobMu.Unlock()
+	s.status(w, r)
+}
+
 func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w, r) {
 		return
 	}
-	s.startJob("scan", "Scanning chats", func(ctx context.Context, progress func(int, int)) error {
-		chats, err := s.tg.Scan(ctx, progress)
+	place, ok := s.startJob("scan", "Scanning chats", func(ctx context.Context, progress func(int, int)) error {
+		prev := map[string]store.Chat{}
+		for _, c := range s.store.Chats() {
+			prev[c.Key] = c
+		}
+		chats, err := s.tg.Scan(ctx, prev, progress)
 		if ctx.Err() != nil {
 			// A partial scan would drop chats from the list, so keep the old one.
 			s.setResult("Scan stopped. Your previous results are unchanged.")
@@ -347,6 +452,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		}
 		return s.store.ReplaceChats(chats)
 	})
+	queued(w, place, ok)
 	s.status(w, r)
 }
 
@@ -359,7 +465,11 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	all := r.URL.Query().Get("all") == "1"
-	s.startJob("analyze", "AI is reading your chats", func(ctx context.Context, progress func(int, int)) error {
+	name := "analyze"
+	if all {
+		name = "analyze-all"
+	}
+	place, ok := s.startJob(name, "AI is reading your chats", func(ctx context.Context, progress func(int, int)) error {
 		var todo []store.Chat
 		for _, c := range s.store.Chats() {
 			if c.Kind != store.KindDeleted && (all || c.Analysis == nil) {
@@ -406,6 +516,7 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+	queued(w, place, ok)
 	s.status(w, r)
 }
 
@@ -550,10 +661,12 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	label := map[string]string{"leave": "Leaving", "mute": "Muting", "archive": "Archiving", "read": "Marking read"}[action]
-	started := s.startJob("bulk", fmt.Sprintf("%s %d chat%s", label, len(keys), plural(len(keys))), func(ctx context.Context, progress func(int, int)) error {
-		pause := 300 * time.Millisecond
+	place, ok := s.startJob("bulk", fmt.Sprintf("%s %d chat%s", label, len(keys), plural(len(keys))), func(ctx context.Context, progress func(int, int)) error {
+		// A short gap between calls keeps Telegram from rate-limiting us
+		// often; when it does, the wait is shown and the job carries on.
+		pause := 100 * time.Millisecond
 		if action == "leave" {
-			pause = 700 * time.Millisecond // leaving is the most rate-limited call
+			pause = 300 * time.Millisecond // leaving is the most rate-limited call
 		}
 		t := s.run(ctx, action, spec, keys, true, pause, progress)
 		msg := t.message(spec.verb)
@@ -563,9 +676,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request) {
 		s.setResult(msg)
 		return nil
 	})
-	if !started {
-		toast(w, "Another job is still running. Wait for it to finish.")
-	}
+	queued(w, place, ok)
 	s.status(w, r)
 }
 
@@ -578,6 +689,22 @@ func plural(n int) string {
 
 // toast asks the page to show a message and refresh the overview stats.
 func toast(w http.ResponseWriter, msg string) {
-	b, _ := json.Marshal(map[string]any{"toast": msg, "statsChanged": true})
+	trigger(w, map[string]any{"toast": msg, "statsChanged": true})
+}
+
+// trigger adds client-side events to the response's HX-Trigger header,
+// keeping any set earlier in the same response. Two toasts are joined.
+func trigger(w http.ResponseWriter, events map[string]any) {
+	merged := map[string]any{}
+	if prev := w.Header().Get("HX-Trigger"); prev != "" {
+		_ = json.Unmarshal([]byte(prev), &merged)
+	}
+	for k, v := range events {
+		if old, ok := merged[k].(string); ok && k == "toast" {
+			v = old + " · " + v.(string)
+		}
+		merged[k] = v
+	}
+	b, _ := json.Marshal(merged)
 	w.Header().Set("HX-Trigger", string(b))
 }

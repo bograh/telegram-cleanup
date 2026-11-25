@@ -14,7 +14,7 @@ templ DashboardPage(d Dashboard) {
 				if d.Me != "" {
 					<span class="me">{ d.Me }</span>
 				}
-				@JobStatus(d.Job, d.AIEnabled, d.Total > 0)
+				@JobStatus(d.Job, d.Queue, d.AIEnabled, d.Total > 0)
 			</div>
 		</header>
 		<main class="page">
@@ -26,48 +26,82 @@ templ DashboardPage(d Dashboard) {
 	}
 }
 
-// JobStatus holds the Scan / Analyze buttons and live progress. It polls itself while a job runs.
-templ JobStatus(j Job, aiEnabled, hasChats bool) {
+// JobStatus holds the Scan / Analyze buttons, live progress and the queue of
+// jobs waiting their turn. It polls itself while a job runs.
+templ JobStatus(j Job, queue []QueuedJob, aiEnabled, hasChats bool) {
 	if j.Running {
 		<div id="job" class="job running" hx-get="/status" hx-trigger="every 1s" hx-swap="outerHTML">
-			<div class="job-label">
-				<span class="spinner" aria-hidden="true"></span>
-				{ j.Msg }
-				if j.Total > 0 {
-					<span class="muted">{ fmt.Sprintf("%d / %d", j.Done, j.Total) }</span>
+			<div class="job-progress">
+				<div class="job-label">
+					<span class="spinner" aria-hidden="true"></span>
+					{ j.Msg }
+					if j.Total > 0 {
+						<span class="muted">{ fmt.Sprintf("%d / %d", j.Done, j.Total) }</span>
+					}
+				</div>
+				<div class="bar"><span style={ fmt.Sprintf("width:%d%%", j.Percent()) }></span></div>
+				if w := j.Waiting(); w != "" {
+					<div class="job-wait" title="The service asked us to slow down. The job continues on its own.">⏳ { w }</div>
+				}
+				if j.Stopping {
+					<button class="btn tiny ghost stop" disabled>Stopping…</button>
+				} else {
+					<button class="btn tiny ghost stop" hx-post="/stop" hx-target="#job" hx-swap="outerHTML" hx-disabled-elt="this" title="Stop now. Finished work is kept.">■ Stop</button>
 				}
 			</div>
-			<div class="bar"><span style={ fmt.Sprintf("width:%d%%", j.Percent()) }></span></div>
-			if j.Stopping {
-				<button class="btn tiny ghost stop" disabled>Stopping…</button>
-			} else {
-				<button class="btn tiny ghost stop" hx-post="/stop" hx-target="#job" hx-swap="outerHTML" hx-disabled-elt="this" title="Stop now. Finished work is kept.">■ Stop</button>
+			if len(queue) > 0 {
+				<ol class="job-queue" aria-label="Up next">
+					<li class="muted">Up next:</li>
+					for _, q := range queue {
+						<li class="queued">
+							{ q.Msg }
+							<button
+								class="unqueue"
+								type="button"
+								hx-post="/queue/cancel"
+								hx-vals={ templ.JSONString(map[string]int{"id": q.ID}) }
+								hx-target="#job"
+								hx-swap="outerHTML"
+								title="Remove from the queue"
+								aria-label={ "Remove " + q.Msg + " from the queue" }
+							>×</button>
+						</li>
+					}
+				</ol>
 			}
+			@jobButtons(j, aiEnabled, hasChats)
 		</div>
 	} else {
 		<div id="job" class="job">
 			if j.Err != "" {
 				<span class="job-error" title={ j.Err }>⚠ { j.Err }</span>
 			}
-			<button class="btn" hx-post="/scan" hx-target="#job" hx-swap="outerHTML">
-				if hasChats {
-					Rescan Telegram
-				} else {
-					Scan Telegram
-				}
-			</button>
-			if aiEnabled {
-				<button class="btn primary" hx-post="/analyze" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } title="Analyze chats that don't have a verdict yet">
-					✦ Analyze with AI
-				</button>
-				<button class="btn ghost small" hx-post="/analyze?all=1" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } hx-confirm="Re-run the AI on every chat? This repeats the API calls.">
-					Re-analyze all
-				</button>
-			} else {
-				<span class="muted small" title="Set AI_BASE_URL, AI_API_KEY and AI_MODEL in .env">AI not configured</span>
-			}
+			@jobButtons(j, aiEnabled, hasChats)
 		</div>
 	}
+}
+
+// jobButtons start a scan or analysis. While another job runs they queue it.
+templ jobButtons(j Job, aiEnabled, hasChats bool) {
+	<div class="job-buttons">
+		<button class={ "btn", templ.KV("small", j.Running) } hx-post="/scan" hx-target="#job" hx-swap="outerHTML" title={ queueHint(j, "Fetch your chats from Telegram") }>
+			if hasChats {
+				Rescan Telegram
+			} else {
+				Scan Telegram
+			}
+		</button>
+		if aiEnabled {
+			<button class={ "btn", templ.KV("primary", !j.Running), templ.KV("small", j.Running) } hx-post="/analyze" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } title={ queueHint(j, "Analyze chats that don't have a verdict yet") }>
+				✦ Analyze with AI
+			</button>
+			<button class="btn ghost small" hx-post="/analyze?all=1" hx-target="#job" hx-swap="outerHTML" disabled?={ !hasChats } title={ queueHint(j, "Run the AI again on every chat") } hx-confirm="Re-run the AI on every chat? This repeats the API calls.">
+				Re-analyze all
+			</button>
+		} else {
+			<span class="muted small" title="Set AI_BASE_URL, AI_API_KEY and AI_MODEL in .env">AI not configured</span>
+		}
+	</div>
 }
 
 templ OverviewSection(d Dashboard) {

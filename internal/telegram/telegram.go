@@ -42,6 +42,27 @@ type Client struct {
 	// QR code; loggedIn latches that signal.
 	loggedIn qrlogin.LoggedIn
 	qrToken  qrlogin.Token
+
+	// onWait is told when Telegram rate-limits us (until is when calls
+	// resume) and again with a zero time once the wait is over.
+	onWait func(until time.Time)
+}
+
+// OnRateLimit registers a callback for Telegram FLOOD_WAIT pauses, so a
+// long wait can be shown instead of looking like a stalled job.
+func (c *Client) OnRateLimit(fn func(until time.Time)) {
+	c.mu.Lock()
+	c.onWait = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) waiting(until time.Time) {
+	c.mu.Lock()
+	fn := c.onWait
+	c.mu.Unlock()
+	if fn != nil {
+		fn(until)
+	}
 }
 
 // New starts the MTProto connection in the background. The session is stored
@@ -125,29 +146,42 @@ func (c *Client) Password(ctx context.Context, pw string) error {
 	return nil
 }
 
-// retry runs fn, sleeping through FLOOD_WAIT errors.
-func retry(ctx context.Context, fn func() error) error {
+// retry runs fn, sleeping through FLOOD_WAIT errors and reporting each wait.
+func (c *Client) retry(ctx context.Context, fn func() error) error {
 	for {
 		err := fn()
 		if err == nil {
 			return nil
 		}
-		if again, ferr := tgerr.FloodWait(ctx, err); again {
-			continue
-		} else if ferr != nil {
-			return ferr
+		d, ok := tgerr.AsFloodWait(err)
+		if !ok {
+			return err
 		}
-		return err
+		d += time.Second
+		c.waiting(time.Now().Add(d))
+		t := time.NewTimer(d)
+		select {
+		case <-t.C:
+			c.waiting(time.Time{})
+		case <-ctx.Done():
+			t.Stop()
+			c.waiting(time.Time{})
+			return ctx.Err()
+		}
 	}
 }
 
 // Progress is called during a scan with (done, total).
 type Progress func(done, total int)
 
+// scanWorkers is how many chats have their history sampled at once.
+const scanWorkers = 4
+
 // Scan lists every channel, group and bot, plus 1:1 chats with deleted
 // accounts (other personal chats are skipped), then samples the latest
-// messages of each to estimate activity.
-func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, error) {
+// messages of each to estimate activity. Chats in prev whose newest message
+// hasn't changed reuse their earlier sample instead of fetching it again.
+func (c *Client) Scan(ctx context.Context, prev map[string]store.Chat, progress Progress) ([]*store.Chat, error) {
 	if err := c.wait(ctx); err != nil {
 		return nil, err
 	}
@@ -223,39 +257,82 @@ func (c *Client) Scan(ctx context.Context, progress Progress) ([]*store.Chat, er
 		return nil, fmt.Errorf("listing dialogs: %w", err)
 	}
 
-	out := make([]*store.Chat, 0, len(items))
-	for i, it := range items {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	// Work out which chats need their history fetched.
+	var todo []item
+	for _, it := range items {
+		ch := it.chat
+		if ch.Kind == store.KindDeleted {
+			continue // personal history: don't read it, store it or send it to the AI
 		}
-		if progress != nil {
-			progress(i, len(items))
-		}
-		if it.chat.Kind == store.KindDeleted {
-			// Personal history: don't read it, store it or send it to the AI.
-			out = append(out, it.chat)
+		if p, ok := prev[ch.Key]; ok && p.Sampled && p.TopMessage == ch.TopMessage {
+			ch.Samples, ch.Sampled, ch.SampleCount, ch.SampleSince = p.Samples, true, p.SampleCount, p.SampleSince
+			ch.MsgsPerDay = msgsPerDay(ch.SampleCount, ch.SampleSince, now)
 			continue
 		}
-		if err := c.sample(ctx, it.chat, it.peer, now); err != nil && ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		out = append(out, it.chat)
-		select { // be gentle with rate limits, but stop promptly
-		case <-time.After(150 * time.Millisecond):
+		todo = append(todo, it)
+	}
+
+	var (
+		mu   sync.Mutex
+		done int
+		wg   sync.WaitGroup
+		jobs = make(chan item)
+	)
+	if progress != nil {
+		progress(0, len(todo))
+	}
+	for range min(scanWorkers, len(todo)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for it := range jobs {
+				// A failed sample just leaves the chat without snippets; it's
+				// fetched again on the next scan.
+				_ = c.sample(ctx, it.chat, it.peer, now)
+				mu.Lock()
+				done++
+				if progress != nil {
+					progress(done, len(todo))
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+feed:
+	for _, it := range todo {
+		select {
+		case jobs <- it:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			break feed
 		}
 	}
-	if progress != nil {
-		progress(len(items), len(items))
+	close(jobs)
+	wg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	out := make([]*store.Chat, len(items))
+	for i, it := range items {
+		out[i] = it.chat
 	}
 	return out, nil
+}
+
+// msgsPerDay estimates activity from count messages posted since oldest.
+func msgsPerDay(count int, oldest, now time.Time) float64 {
+	if count < 2 {
+		return 0
+	}
+	span := now.Sub(oldest).Hours() / 24
+	span = math.Max(span, 1.0/24)
+	return math.Round(float64(count)/span*10) / 10
 }
 
 // sample fetches the latest messages to get text snippets and a msgs/day rate.
 func (c *Client) sample(ctx context.Context, ch *store.Chat, peer tg.InputPeerClass, now time.Time) error {
 	var res tg.MessagesMessagesClass
-	err := retry(ctx, func() (err error) {
+	err := c.retry(ctx, func() (err error) {
 		res, err = c.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peer, Limit: 15})
 		return err
 	})
@@ -268,6 +345,7 @@ func (c *Client) sample(ctx context.Context, ch *store.Chat, peer tg.InputPeerCl
 	}
 	var oldest int
 	count := 0
+	ch.Samples = nil
 	for _, m := range mod.GetMessages() {
 		msg, ok := m.(*tg.Message)
 		if !ok {
@@ -285,11 +363,11 @@ func (c *Client) sample(ctx context.Context, ch *store.Chat, peer tg.InputPeerCl
 			}
 		}
 	}
-	if count > 1 {
-		span := now.Sub(time.Unix(int64(oldest), 0)).Hours() / 24
-		span = math.Max(span, 1.0/24)
-		ch.MsgsPerDay = math.Round(float64(count)/span*10) / 10
+	ch.Sampled, ch.SampleCount = true, count
+	if count > 0 {
+		ch.SampleSince = time.Unix(int64(oldest), 0)
 	}
+	ch.MsgsPerDay = msgsPerDay(count, ch.SampleSince, now)
 	return nil
 }
 
@@ -318,7 +396,7 @@ func (c *Client) Leave(ctx context.Context, ch store.Chat) error {
 	if err := c.wait(ctx); err != nil {
 		return err
 	}
-	return retry(ctx, func() error {
+	return c.retry(ctx, func() error {
 		switch ch.PeerType {
 		case store.PeerChannel:
 			_, err := c.api.ChannelsLeaveChannel(ctx, &tg.InputChannel{ChannelID: ch.PeerID, AccessHash: ch.AccessHash})
@@ -361,7 +439,7 @@ func (c *Client) Mute(ctx context.Context, ch store.Chat) error {
 	if err := c.wait(ctx); err != nil {
 		return err
 	}
-	return retry(ctx, func() error {
+	return c.retry(ctx, func() error {
 		_, err := c.api.AccountUpdateNotifySettings(ctx, &tg.AccountUpdateNotifySettingsRequest{
 			Peer:     &tg.InputNotifyPeer{Peer: inputPeer(ch)},
 			Settings: tg.InputPeerNotifySettings{MuteUntil: math.MaxInt32},
@@ -375,7 +453,7 @@ func (c *Client) Archive(ctx context.Context, ch store.Chat) error {
 	if err := c.wait(ctx); err != nil {
 		return err
 	}
-	return retry(ctx, func() error {
+	return c.retry(ctx, func() error {
 		_, err := c.api.FoldersEditPeerFolders(ctx, []tg.InputFolderPeer{{Peer: inputPeer(ch), FolderID: 1}})
 		return err
 	})
@@ -386,7 +464,7 @@ func (c *Client) MarkRead(ctx context.Context, ch store.Chat) error {
 	if err := c.wait(ctx); err != nil {
 		return err
 	}
-	return retry(ctx, func() error {
+	return c.retry(ctx, func() error {
 		if ch.PeerType == store.PeerChannel {
 			_, err := c.api.ChannelsReadHistory(ctx, &tg.ChannelsReadHistoryRequest{
 				Channel: &tg.InputChannel{ChannelID: ch.PeerID, AccessHash: ch.AccessHash},

@@ -288,3 +288,20 @@ func TestStopDuringRateLimitWait(t *testing.T) {
 		t.Fatalf("err=%v after %v: a 60s Retry-After must not block Stop", err, time.Since(start))
 	}
 }
+
+func TestTrimSamplesKeepsAFewShortSnippets(t *testing.T) {
+	long := strings.Repeat("é", maxSampleRune+50)
+	got := trimSamples([]string{long, "b", "c", "d", "e", "f"})
+	if len(got) != maxSamples {
+		t.Fatalf("kept %d snippets, want %d", len(got), maxSamples)
+	}
+	if n := len([]rune(got[0])); n != maxSampleRune+1 { // plus the ellipsis
+		t.Fatalf("first snippet has %d runes", n)
+	}
+	if got[1] != "b" {
+		t.Fatalf("short snippet changed: %q", got[1])
+	}
+	if len(trimSamples(nil)) != 0 {
+		t.Fatal("nil input should give no snippets")
+	}
+}

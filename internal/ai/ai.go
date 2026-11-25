@@ -55,6 +55,25 @@ type Analyzer struct {
 	// useCompletionTokens is set when the provider rejects max_tokens and
 	// wants max_completion_tokens (newer OpenAI reasoning models).
 	useCompletionTokens bool
+	// onWait is told when the provider rate-limits us and when calls resume.
+	onWait func(until time.Time)
+}
+
+// OnRateLimit registers a callback for rate-limit pauses (HTTP 429), so a
+// long wait can be shown instead of looking like a stalled job.
+func (a *Analyzer) OnRateLimit(fn func(until time.Time)) {
+	a.mu.Lock()
+	a.onWait = fn
+	a.mu.Unlock()
+}
+
+func (a *Analyzer) waiting(until time.Time) {
+	a.mu.Lock()
+	fn := a.onWait
+	a.mu.Unlock()
+	if fn != nil {
+		fn(until)
+	}
 }
 
 func New(cfg Config) *Analyzer {
@@ -240,7 +259,13 @@ func (a *Analyzer) complete(ctx context.Context, system, user string, wantTokens
 			}
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("AI API %s: %s", resp.Status, truncate(errMsg, 300))
-				if !sleep(ctx, retryAfter(resp.Header, attempt)) {
+				d := retryAfter(resp.Header, attempt)
+				if resp.StatusCode == 429 {
+					a.waiting(time.Now().Add(d))
+				}
+				ok := sleep(ctx, d)
+				a.waiting(time.Time{})
+				if !ok {
 					return ctx.Err()
 				}
 				continue
@@ -345,6 +370,25 @@ type Progress func(done, total int)
 // tokensPerChat is a generous estimate of one verdict's JSON size.
 const tokensPerChat = 90
 
+// Message snippets are most of each request's input, and input counts toward
+// providers' tokens-per-minute limits, so only a few short ones are sent.
+const (
+	maxSamples    = 4
+	maxSampleRune = 140
+)
+
+// trimSamples keeps the first few snippets, shortened, for the AI.
+func trimSamples(in []string) []string {
+	out := make([]string, 0, min(len(in), maxSamples))
+	for _, s := range in[:min(len(in), maxSamples)] {
+		if r := []rune(s); len(r) > maxSampleRune {
+			s = string(r[:maxSampleRune]) + "…"
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // classifyBatch classifies one batch, splitting it in half whenever the
 // provider says the request is too large (e.g. Groq's 1000 output tokens per
 // minute on free tiers) until it fits or a single chat still doesn't.
@@ -360,7 +404,7 @@ func (a *Analyzer) classifyBatch(ctx context.Context, system string, b []store.C
 			Key: c.Key, Kind: string(c.Kind), Title: c.Title, Username: c.Username,
 			Members: c.Members, MsgsPerDay: c.MsgsPerDay, Unread: c.Unread,
 			Muted: c.Muted, Archived: c.Archived, Owner: c.Owner, ScamFlag: c.ScamFlag,
-			Samples: c.Samples,
+			Samples: trimSamples(c.Samples),
 		}
 		if !c.LastMessage.IsZero() {
 			in[i].LastMessage = c.LastMessage.Format("2006-01-02")
